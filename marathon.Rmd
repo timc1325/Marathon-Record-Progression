@@ -1,0 +1,358 @@
+---
+title: "Marathon Time Series"
+author: "Tim"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+plot_acf <- function(x,mlag=25,yl=0.5){
+  plot(acf(x,plot=F,lag.max = mlag)$acf[-1],
+       type="h", 
+       main="Autocorrelation Function", 
+       xlab="Lag",  
+       ylab="ACF",
+       ylim=c(-yl,yl),
+       las=1,
+       xaxt="n")
+  abline(h=0)
+  abline(h=c(0.2,-0.2),lty=2,col=2)
+  x <- c(1:mlag)
+  y <- c(1:mlag)
+  axis(1, at=x, labels=y)
+}
+plot_pacf <- function(x,mlag=25,yl=0.5){
+  plot(pacf(x,plot=F,lag.max = mlag)$acf,
+       type="h", 
+       main="Partial Autocorrelation Function", 
+       xlab="Lag",     
+       ylab="PACF", 
+       ylim=c(-yl,yl),
+       las=1,
+       xaxt="n")
+  abline(h=0)
+  abline(h=c(0.2,-0.2),lty=2,col=2)
+  x <- c(1:mlag)
+  y <- c(1:mlag)
+  axis(1, at=x, labels=y)
+}
+
+```
+
+
+```{r Preprocess}
+library(tidyverse)
+library(astsa) 
+df=read_csv("Marathon.csv")
+marathon = df[c("Date","Competitor","Nat","DOB","Venue","Mark")] %>% arrange(Date)
+df = marathon["Mark"]
+
+#split data into training and testing
+df = pull(df,Mark)
+train = df[1:round(length(df)*0.8)]
+test = df[(round(length(df)*0.8)+1):length(df)]
+
+#TRY filling in missing value
+train<- append(train,7777,after=79) #mean of August
+plot.ts(train) #take a look
+#ACF and PACF on Raw Data
+par(mfrow=c(2,1))
+plot_acf(train)
+plot_pacf(train)
+
+#Estimate the spectrum of the raw data using the periodogram and either smoothed periodogram or AR spectrum. Comment on any clear cycles and the overall distribution of the variance by frequency, and its relationship to the smoothness of your time series.
+mvspec(train, log="no")
+mvspec(train, log="no")
+cols = c("#009999","#B64830")
+abline(v=1/12, lty=6,col=cols[1],lwd=2)
+abline(v=1/6, lty=6,col=cols[2],lwd=2)
+text(1/12,y=-100000,"1/12",cex=0.7,font=2,col=cols[1],xpd=NA)
+text(1/6,y=-100000,"1/6",cex=0.7,font=2,col=cols[2],xpd=NA)
+
+#smooth periodogram
+ar(train, order.max=30)
+spec.ar(train, order = 12, log="no")
+mvspec(train,kernel("daniell", 4))
+
+
+```
+```{r}
+n = length(train)
+AIC = rep(0, 30) -> AICc -> BIC
+for (k in 1:30){
+  sigma2 = ar(train, order=k, aic=FALSE)$var.pred
+  BIC[k] = log(sigma2) + (k*log(n)/n)
+  AICc[k] = log(sigma2) + ((n+k)/(n-k-2))
+  AIC[k] = log(sigma2) + ((n+2*k)/n)
+  }
+IC = cbind(AIC, BIC+1)
+ts.plot(IC, type="o", xlab="p", ylab="AIC / BIC")
+```
+
+
+```{r impute testing data}
+#mean of each month before removing linear trend
+meanlist0=c()
+for (i in 1:12){
+  k = i
+  count = 0
+  result =0
+  while(k<=211){
+    result = result + train[k]
+    k = k+12
+    count = count + 1
+  }
+  meanlist0 = append(meanlist0,result/count)
+}
+
+test <- append(test,meanlist0[7],after = 240-210) #hot July.2021
+test <- append(test,meanlist0[4:8],after = 230-210) #Covid
+```
+
+
+```{r}
+
+months <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+plot(1:12, meanlist0, type = "c",xlab = "", ylab = "") 
+points(1:12, meanlist0, pch = months, col = 1:4)
+```
+
+
+```{r Remove Linear Trend}
+#run a linear regression and remove obvious linear trend (people are faster)
+c=1:211
+length(train)
+lm(log(train)~c) %>% summary
+y = exp(8.962-1.257e-04 *c)
+plot.ts(train)
+lines(c,y)
+train1 <- train-y
+```
+
+```{r Remove Cycles}
+# Remove obvious cycles
+meanlist=c()
+for (i in 1:12){
+  k = i
+  count = 0
+  result =0
+  while(k<=211){
+    result = result + train1[k]
+    k = k+12
+    count = count + 1
+  }
+  meanlist = append(meanlist,result/count)
+}
+train2 <- train1
+for (i in 1:211){
+  if (i%%12==0) n =12 else n=i%%12
+  train2[i] <- train1[i] - meanlist[n]
+}
+```
+
+```{r sample residual acf pacf}
+plot.ts(train2)
+par(mfrow=c(2,1))
+plot_acf(train)
+plot_acf(train2)
+plot_pacf(train)
+plot_pacf(train2)
+#It seems like both PACF AND ACF tails off
+```
+
+
+
+```{r adjust testing by remove linear trend, cycles}
+ind2 <- 212:(212+length(test)-1)
+y_test = exp(8.962-1.257e-04 *ind2)
+test1 <- test - y_test
+test2 <- test1
+for (i in ind2){
+  if (i%%12==0) n = 12 else n=i%%12
+  test2[i-211] <- test1[i-211] - meanlist[n]
+} 
+
+```
+
+```{r ARIMA Model parameter selection Metric(using training itself), warning=FALSE}
+#PLOT AIC BIC graph as metric for choosing model parameters
+library(forecast)
+n = length(train2)
+nn = length(test2)
+parlim=10
+aic = matrix(0, nrow = parlim, ncol = parlim) 
+aicc = matrix(0, nrow = parlim, ncol = parlim) 
+bic  = matrix(0, nrow = parlim, ncol = parlim) 
+rmse  = matrix(0, nrow = parlim, ncol = parlim) 
+for (i in 1:parlim){
+  for (j in 1:parlim){
+    temp = Arima(train2, order=c(i-1,0,j-1))
+    aic[i,j] = temp$aic
+    aicc[i,j] = temp$aicc
+    bic[i,j] = temp$bic
+    rmse[i,j] = sqrt(mean((temp$residuals)^2))
+  }
+}
+which(aic==min(aic),arr.ind=TRUE) #ARMA(7,7) 
+which(bic==min(bic),arr.ind=TRUE) #ARMA(1,1)
+which(aicc==min(aicc),arr.ind=TRUE) #ARMA(7,7)
+which(rmse==min(rmse),arr.ind=TRUE) #ARMA(8,8)
+rmse
+```
+```{r function for training result}
+# 1-step look ahead for training (so first few preds are the same as training observations)
+mf_train <- function (df_train, df_test,p,d1,q){
+  n = length(df_train)
+  nn = length(df_test)
+  mod <- Arima(df_train, order=c(p,d1,q))
+  coeff <- mod %>% summary() %>% coefficients
+  residuals_temp1 <- mod %>% summary %>% residuals
+  residuals <- rep(0, nn) 
+  preds <- df_train
+  m <- max(p,q)
+  #first m element is special, we need test data to predict
+  if (p==0 & q==0){
+    preds<- rep(coeff[1],nn)
+    residuals <- df_test-preds
+    rmse = sqrt(mean(residuals^2))
+    return (list("RMSE"=rmse,"Prediction"=preds,"Model"=mod))
+  }
+  #from then on, we can repeatedly get the predictions for all else
+  for(i in (m+1):nn){
+    preds[i] <- sum(coeff[1:p] * df_test[(i-1):(i-p)]) + 
+                sum(coeff[(p+1):(p+q)] * residuals[(i-1):(i-q)]) + coeff[p+q+1] 
+    residuals[i] <- df_test[i] - preds[i] 
+  } 
+  rmse = sqrt(mean(residuals^2))
+  result <- list("RMSE"=rmse,"Prediction"=preds,"Model"=mod,"r"=residuals)
+  result
+}
+
+rmse_mat= matrix(0,nrow=10,ncol=10)
+for (i in 1:10){
+  for (j in 1:10){
+    rmse_mat[i,j] <- mf_train(train2,train2,i-1,0,j-1)$RMSE
+  }
+}
+which(rmse_mat==min(rmse_mat),arr.ind=T) #ARMA(7,6)
+#Training model means more on testing data, so we use ARIMA 7,0,6
+rmse_mat
+```
+
+```{r}
+plot.ts(train2)
+lines(c,mf_train(train2,train2,7,0,6)$Prediction,col=5,lty=5)
+plot.ts(train2)
+lines(c,mf_train(train2,train2,1,0,1)$Prediction,col=2,lty=5)
+Arima(train2,order=c(1,0,1))
+```
+```{r}
+sarima(train2,1,0,1)
+```
+
+```{r function ARIMA, warning=FALSE}
+# 1-step look ahead
+mf <- function (df_train, df_test,p,d1,q){
+  n = length(df_train)
+  nn = length(df_test)
+  mod <- Arima(df_train, order=c(p,d1,q))
+  coeff <- mod %>% summary() %>% coefficients
+  residuals_temp1 <- mod %>% summary %>% residuals
+  residuals <- rep(0, nn) 
+  preds <- rep(0,nn)
+  m <- max(p,q)
+  #first m element is special, we need test data to predict
+  if (p==0 & q==0){
+    preds<- rep(coeff[1],nn)
+    residuals <- df_test-preds
+    rmse = sqrt(mean(residuals^2))
+    return (list("RMSE"=rmse,"Prediction"=preds,"Model"=mod))
+  }
+  for (ind in 1:m){
+    
+    if (ind > p){
+      preds[ind] <- sum(coeff[1:p] * df_test[(i-1):(i-p)]) +
+              sum(coeff[(p+1):(p+q)] * c(residuals_temp1[(n-q+ind):n],residuals[0:(ind-1)])) + coeff[p+q+1]
+      residuals[ind] <- df_test[ind] - preds[ind]
+    }
+    else if (ind > q){
+      preds[ind] <- sum(coeff[1:p] * c(df_train[(n-p+ind):n],preds[0:(ind-1)])) +
+              sum(coeff[(p+1):(p+q)] * residuals[(i-1):(i-q)]) + coeff[p+q+1]
+      residuals[ind] <- df_test[ind] - preds[ind]
+    }
+    else{
+    preds[ind] <- sum(coeff[1:p] * c(df_train[(n-p+ind):n],preds[0:(ind-1)])) +
+              sum(coeff[(p+1):(p+q)] * c(residuals_temp1[(n-q+ind):n],residuals[0:(ind-1)])) + coeff[p+q+1]
+    residuals[ind] <- df_test[ind] - preds[ind]
+    }
+  }
+  #from then on, we can repeatedly get the predictions for all else
+  for(i in (m+1):nn){
+    preds[i] <- sum(coeff[1:p] * df_test[(i-1):(i-p)]) + 
+                sum(coeff[(p+1):(p+q)] * residuals[(i-1):(i-q)]) + coeff[p+q+1] 
+    residuals[i] <- df_test[i] - preds[i] 
+  } 
+  rmse = sqrt(mean(residuals^2))
+  result <- list("RMSE"=rmse,"Prediction"=preds,"Model"=mod,"r"=residuals)
+  result
+}
+
+```
+
+
+```{r}
+p = 1
+q = 1
+res <- mf(train2,test2,p,0,q)
+preds <- res$Prediction
+cat("Prediction of testing using model has a RMSE of:", res$RMSE)
+#transform into original data
+for (i in ind2){
+  if (i%%12==0) k =12 else k=i%%12
+  preds[i-n] <- preds[i-n] + meanlist[k]
+}
+
+preds <-preds+y_test
+
+plot(ind2,preds,type = "l", col = cols[1], ylab = "value",ylim=c(7250,8100))
+lines(ind2,test)
+
+```
+
+
+
+
+```{r}
+#h-step lookahead
+library(forecast)
+fit <- Arima(train2, order=c(1,0,1))
+future=60
+futurVal <- forecast(fit,h=future, level=c(90))
+plot(futurVal)
+lines(ind2,test2,col="red",lty=2)
+
+#transform into original data
+for (i in 1:future){
+  i2 <- i+211
+  if (i2%%12==0) k =12 else k=i2%%12
+  futurVal$mean[i] <- futurVal$mean[i] + meanlist[k]
+  futurVal$lower[i] <- futurVal$lower[i] + meanlist[k]
+  futurVal$upper[i] <- futurVal$upper[i] + meanlist[k]
+}
+for (i in 1:n){
+  if (i%%12==0) k =12 else k=i%%12
+  futurVal$x[i] <- futurVal$x[i] + meanlist[k]
+}
+y = exp(8.962-1.257e-04 *(211:(210+future)))
+futurVal$mean <-futurVal$mean+y
+futurVal$lower <-futurVal$lower+y
+futurVal$upper <-futurVal$upper+y
+futurVal$x <-futurVal$x+y
+plot(futurVal,xlim=c(n,n+nn))
+lines(ind2,test)
+#h-step look ahead works pretty bad
+sqrt(mean(futurVal$residuals^2))
+```
+
+
